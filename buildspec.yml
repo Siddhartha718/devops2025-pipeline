@@ -1,0 +1,114 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      # Install Terraform CLI (adjust version as needed)
+      - TF_VERSION="1.8.5" # Latest stable as of current date
+      - curl -LO https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
+      - unzip terraform_${TF_VERSION}_linux_amd64.zip
+      - sudo mv terraform /usr/local/bin/
+      - terraform --version
+
+      # Install tfsec (Terraform security scanner) [cite: 5]
+      - curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+      - tfsec --version
+
+      # Install Trivy (Docker image scanner) [cite: 5]
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | bash -s -- -b /usr/local/bin
+      - trivy --version
+
+      # Install kubectl (for interacting with Kubernetes, needed for Sealed Secrets application)
+      - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      - sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      - kubectl version --client
+
+      # Install kubeseal (to potentially re-seal secrets if needed in the pipeline, though typically done locally)
+      # You might not need this in CodeBuild if sealed secrets are already committed.
+      # - OS=$(uname -s)
+      # - ARCH=$(uname -m)
+      # - KUBESEAL_VERSION="0.26.0" # Use a stable version
+      # - wget https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-${OS}-${ARCH}.tar.gz
+      # - tar -xzf kubeseal-${KUBESEAL_VERSION}-${OS}-${ARCH}.tar.gz kubeseal
+      # - sudo install -o root -g root -m 0755 kubeseal /usr/local/bin/kubeseal
+      # - kubeseal --version
+
+      # Add any other project-specific dependencies (e.g., Node.js, Python, Java tools)
+      # - npm install # if you have a Node.js project
+      # - pip install -r requirements.txt # if you have a Python project
+
+  pre_build:
+    commands:
+      - echo "Starting pre-build phase..."
+
+      # Run tfsec for Terraform code security scanning [cite: 5]
+      - echo "Running tfsec scan on Terraform code..."
+      - cd terraform/ # Assuming your Terraform code is in a 'terraform' directory
+      - tfsec . --format compact --ignore-info || { echo "tfsec found issues. Exiting build."; exit 1; }
+      - cd .. # Go back to root
+
+      # Authenticate Docker to ECR (if building and pushing Docker images)
+      # Ensure your CodeBuild service role has 'ecr:GetAuthorizationToken' and other ECR push permissions
+      # - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      # - AWS_REGION=${AWS_DEFAULT_REGION:-ap-south-1} # Set your default region
+      # - echo "Authenticating to ECR in region ${AWS_REGION} for account ${AWS_ACCOUNT_ID}..."
+      # - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+  build:
+    commands:
+      - echo "Starting build phase..."
+
+      # --- Example: Build a Docker Image (if your project involves a containerized app) ---
+      # - IMAGE_REPO_NAME="your-app-repo" # Replace with your ECR repository name
+      # - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7) # Use short Git hash as tag
+      # - echo "Building Docker image ${IMAGE_REPO_NAME}:${IMAGE_TAG}..."
+      # - docker build -t ${IMAGE_REPO_NAME}:${IMAGE_TAG} .
+      # - docker tag ${IMAGE_REPO_NAME}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+
+      # --- Run Trivy for Docker image scanning (if building a Docker image) [cite: 5] ---
+      # - echo "Running Trivy scan on Docker image ${IMAGE_REPO_NAME}:${IMAGE_TAG}..."
+      # - trivy image --severity HIGH,CRITICAL --format table --exit-code 1 ${IMAGE_REPO_NAME}:${IMAGE_TAG} || { echo "Trivy found critical/high vulnerabilities. Exiting build."; exit 1; }
+
+      # --- Apply Sealed Secrets to Kubernetes (via kubectl) ---
+      # Ensure your CodeBuild service role has permissions to assume a role that can interact with EKS/Kubernetes
+      # Or, configure kubectl to use service account tokens if running on EKS.
+      # You need to ensure your kubeconfig is set up for CodeBuild to access your EKS cluster.
+      # For EKS, typically you'd run:
+      # - aws eks update-kubeconfig --name <your-eks-cluster-name> --region ${AWS_REGION}
+      # - echo "Applying Sealed Secrets to Kubernetes cluster..." [cite: 6]
+      # - kubectl apply -f kubernetes/sealed-secrets/ # Assuming your sealed secrets are here
+
+      # --- Apply / Update Infrastructure via Terraform (if CodeBuild is responsible for this) ---
+      # This is for your CodePipeline's 'Deploy' stage, if it involves Terraform application.
+      # Ensure your CodeBuild service role has permissions for Terraform actions (e.g., EC2, S3, IAM, CodePipeline, CodeBuild, CodeDeploy).
+      # - cd terraform/
+      # - terraform init
+      # - terraform plan -out=tfplan # Good practice to create a plan first
+      # - terraform apply -auto-approve tfplan # Apply the plan [cite: 3]
+      # - cd ..
+
+      # Your application-specific build steps (e.g., compiling, testing, packaging)
+      # - npm test
+      # - npm run build
+      # - mvn package
+
+  post_build:
+    commands:
+      - echo "Starting post-build phase..."
+      # Push Docker Image to ECR (if built)
+      # - echo "Pushing Docker image to ECR..."
+      # - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO_NAME}:${IMAGE_TAG}
+      - echo "Build completed."
+
+artifacts:
+  files:
+    # Specify artifacts to be passed to the next stage (e.g., CodeDeploy or subsequent Kubernetes deployment)
+    # Examples:
+    # - 'target/your-app.jar' # For Java applications
+    # - 'appspec.yml' # For AWS CodeDeploy deployments
+    # - 'kubernetes/**/*.yaml' # For Kubernetes manifests
+    # - 'terraform/**/*.tfplan' # If passing Terraform plan to another stage
+    - '**/*' # This is a common wildcard to include all files in the build output,
+             # but it's generally better to be more specific.
+  # discard-paths: yes # Keep this if you want to flatten the artifact structure
+  # base-directory: 'path/to/build/output' # If your build outputs to a specific directory
